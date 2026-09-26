@@ -1,4 +1,4 @@
-import type { Plugin, PluginInput, PluginModule } from "@opencode-ai/plugin"
+import { Plugin } from "@opencode/plugin"
 import { basename } from "path"
 import { readFileSync, writeFileSync } from "fs"
 import {
@@ -22,16 +22,25 @@ import { runCommand } from "./command"
 import { isTerminalFocused, focusTerminal, captureStartupWindowId, isKDEJumpBackSupported } from "./focus"
 import { shouldSuppressPermissionAlert, prunePermissionAlertState } from "./permission-dedupe"
 
+const IDLE_POLL_INTERVAL_MS = 3000
+const IDLE_CHECK_DELAY_MS = 2000
 const IDLE_COMPLETE_DELAY_MS = 350
 
 export function isCLIClient(clientEnv?: string): boolean {
   return !clientEnv || clientEnv === "cli"
 }
 
-const pendingIdleTimers = new Map<string, ReturnType<typeof setTimeout>>()
+// ---- Session tracking state ----
+
+// Tracks the last time the context hook fired per session (activity indicator)
+const sessionLastContextAt = new Map<string, number>()
+
+// Idle debounce: each pending idle event has a sequence number so late-arriving
+// events from an older idle detection pass are silently discarded.
 const sessionIdleSequence = new Map<string, number>()
 const sessionErrorSuppressionAt = new Map<string, number>()
 const sessionLastBusyAt = new Map<string, number>()
+const pendingIdleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const subagentSessionIds = new Set<string>()
 
 type UnknownRecord = Record<string, unknown>
@@ -59,6 +68,8 @@ function getStringField(record: UnknownRecord | null, key: string): string | nul
   const value = record[key]
   return typeof value === "string" && value.length > 0 ? value : null
 }
+
+// ---- Turn counter ----
 
 let globalTurnCount: number | null = null
 
@@ -88,37 +99,43 @@ function incrementTurnCount(): number {
   return globalTurnCount
 }
 
-// Memory cleanup: Remove old session entries every 5 minutes to prevent leaks
-const cleanupInterval = setInterval(() => {
-  const cutoff = Date.now() - 5 * 60 * 1000 // 5 minutes ago
+// ---- Memory cleanup ----
 
-  // Clean up sessionIdleSequence (use last access time stored separately if needed)
+const cleanupInterval = setInterval(() => {
+  const cutoff = Date.now() - 5 * 60 * 1000
+
+  // Remove idle entries whose timers have already been cleared
   for (const [sessionID] of sessionIdleSequence) {
-    // If not in pendingIdleTimers, it's likely stale
     if (!pendingIdleTimers.has(sessionID)) {
       sessionIdleSequence.delete(sessionID)
-      // Also remove from subagent tracking if stale
       subagentSessionIds.delete(sessionID)
     }
   }
 
-  // Clean up sessionErrorSuppressionAt
   for (const [sessionID, timestamp] of sessionErrorSuppressionAt) {
     if (timestamp < cutoff) {
       sessionErrorSuppressionAt.delete(sessionID)
     }
   }
 
-  // Clean up sessionLastBusyAt
   for (const [sessionID, timestamp] of sessionLastBusyAt) {
     if (timestamp < cutoff) {
       sessionLastBusyAt.delete(sessionID)
     }
   }
 
+  // Prune stale context-activity entries
+  for (const [sessionID, lastAt] of sessionLastContextAt) {
+    if (Date.now() - lastAt > 120_000) {
+      sessionLastContextAt.delete(sessionID)
+    }
+  }
+
   prunePermissionAlertState(cutoff)
 }, 5 * 60 * 1000)
 cleanupInterval.unref()
+
+// ---- Notification helpers ----
 
 function getNotificationTitle(config: NotifierConfig, projectName: string | null): string {
   if (config.showProjectName && projectName) {
@@ -201,12 +218,27 @@ async function handleEvent(
     const title = getNotificationTitle(config, projectName)
     const iconPath = getIconPath(config)
     const onNotificationClick = isKDEJumpBackSupported() ? () => void focusTerminal() : undefined
-    promises.push(sendNotification(title, message, config.timeout, iconPath, config.notificationSystem, config.linux.grouping, onNotificationClick, config.windows.appID))
+    promises.push(
+      sendNotification(
+        title,
+        message,
+        config.timeout,
+        iconPath,
+        config.notificationSystem,
+        config.linux.grouping,
+        onNotificationClick,
+        config.windows.appID,
+      )
+    )
   }
 
   if (isEventSoundEnabled(config, eventType)) {
     const customSoundPath = getSoundPath(config, eventType)
-    const ghosttyOnMac = process.platform === "darwin" && config.notificationSystem === "ghostty" && notificationEnabled && config.suppressGhosttySound
+    const ghosttyOnMac =
+      process.platform === "darwin" &&
+      config.notificationSystem === "ghostty" &&
+      notificationEnabled &&
+      config.suppressGhosttySound
     if (!ghosttyOnMac) {
       const soundVolume = getSoundVolume(config, eventType)
       promises.push(playSound(eventType, customSoundPath, soundVolume))
@@ -234,90 +266,77 @@ async function handleEvent(
   await Promise.allSettled(promises)
 }
 
+// ---- Event data helpers ----
+
+interface SessionData {
+  sessionID: string | null
+  parentID: string | null
+  title: string | null
+}
+
+function getEventData(event: unknown): SessionData {
+  const data = getNestedRecord(event, "data")
+  return {
+    sessionID: getStringField(data, "sessionID"),
+    parentID: getStringField(data, "parentID"),
+    title: getStringField(data, "title"),
+  }
+}
+
 function getSessionIDFromEvent(event: unknown): string | null {
-  const properties = getNestedRecord(event, "properties")
-  return getStringField(properties, "sessionID")
+  const data = getNestedRecord(event, "data")
+  return getStringField(data, "sessionID")
 }
 
 export function getPermissionIDFromEvent(event: unknown): string | null {
-  const properties = getNestedRecord(event, "properties")
-  const id = getStringField(properties, "id")
-  if (id) {
-    return id
+  const data = getNestedRecord(event, "data")
+  if (data) {
+    const request = getNestedRecord(data, "request")
+    return getStringField(request, "id") ?? getStringField(data, "id")
   }
-  const request = getNestedRecord(event, "properties", "request")
-  return getStringField(request, "id")
+  return null
 }
 
-// Grace period letting an auto-approved request resolve before we check the
-// pending list. The permission.asked event always fires first (even when the
-// TUI/CLI auto-replies), so without this wait every request would look pending.
+// Grace period letting auto-approved requests resolve before checking the
+// pending list. Without this wait, a freshly-asked permission always appears
+// pending because the user hasn't had time to approve/deny yet.
 export const PERMISSION_PENDING_GRACE_MS = 300
 
-// True when the request is still awaiting approval. Fails open: any lookup
-// failure means "unknown", and unknown must notify rather than stay silent.
-export async function isPermissionStillPending(client: unknown, permissionID: string): Promise<boolean> {
+// Check whether a permission request is still awaiting approval.
+// Fails open (returns true) so we never silently skip a real notification.
+// Check whether a permission request is still awaiting approval
+export async function isPermissionStillPending(
+  ctx: any,
+  sessionID: string,
+  permissionID: string
+): Promise<boolean> {
+  if (!sessionID) {
+    return true
+  }
   try {
-    // The v1 SDK client type exposes no permission.list API, so go through
-    // the raw HTTP client like the rest of this file goes through (event as any).
-    const inner = (client as any)?._client || (client as any)?.session?._client
-    if (!inner || typeof inner.get !== "function") {
-      return true
-    }
-    const listResponse = await inner.get({ url: "/permission" })
-    const body = listResponse?.data ?? listResponse
-    const pendingList = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : null
-    if (!pendingList) {
-      return true
-    }
-    return pendingList.some((p: { id?: string }) => p?.id === permissionID)
+    const pending = await ctx.permission.list({ sessionID })
+    const list = Array.isArray(pending) ? pending : []
+    return list.some((p: { id?: string }) => p?.id === permissionID)
   } catch {
     return true
   }
 }
 
-interface SessionLifecycleInfo {
-  id: string | null
-  title: string | null
-  parentID: string | null
-}
-
-function getSessionLifecycleInfo(event: unknown): SessionLifecycleInfo {
-  const info = getNestedRecord(event, "properties", "info")
-  return {
-    id: getStringField(info, "id"),
-    title: getStringField(info, "title"),
-    parentID: getStringField(info, "parentID"),
-  }
-}
-
-interface MessageUpdatedInfo {
-  role: string | null
-  sessionID: string | null
-}
-
-function getMessageUpdatedInfo(event: unknown): MessageUpdatedInfo {
-  const info = getNestedRecord(event, "properties", "info")
-  return {
-    role: getStringField(info, "role"),
-    sessionID: getStringField(info, "sessionID"),
-  }
-}
+// ---- Idle management ----
 
 function clearPendingIdleTimer(sessionID: string): void {
   const timer = pendingIdleTimers.get(sessionID)
   if (!timer) {
     return
   }
-
   clearTimeout(timer)
   pendingIdleTimers.delete(sessionID)
 }
 
 function bumpSessionIdleSequence(sessionID: string): number {
-  const nextSequence = (sessionIdleSequence.get(sessionID) ?? 0) + 1
-  sessionIdleSequence.set(sessionID, nextSequence)
-  return nextSequence
+  const next = (sessionIdleSequence.get(sessionID) ?? 0) + 1
+  sessionIdleSequence.set(sessionID, next)
+  return next
 }
 
 function hasCurrentSessionIdleSequence(sessionID: string, sequence: number): boolean {
@@ -328,7 +347,6 @@ function markSessionError(sessionID: string | null): void {
   if (!sessionID) {
     return
   }
-
   sessionErrorSuppressionAt.set(sessionID, Date.now())
   bumpSessionIdleSequence(sessionID)
   clearPendingIdleTimer(sessionID)
@@ -342,33 +360,30 @@ function markSessionBusy(sessionID: string): void {
   clearPendingIdleTimer(sessionID)
 }
 
-function shouldSuppressSessionIdle(sessionID: string, consume: boolean = true): boolean {
+function shouldSuppressSessionIdle(sessionID: string, consume = true): boolean {
   const errorAt = sessionErrorSuppressionAt.get(sessionID)
   if (errorAt === undefined) {
     return false
   }
-
   const busyAt = sessionLastBusyAt.get(sessionID)
   if (typeof busyAt === "number" && busyAt > errorAt) {
     sessionErrorSuppressionAt.delete(sessionID)
     return false
   }
-
   if (consume) {
     sessionErrorSuppressionAt.delete(sessionID)
   }
   return true
 }
 
-async function getElapsedSinceLastPrompt(
-  client: PluginInput["client"],
-  sessionID: string,
-  nowMs: number = Date.now()
-): Promise<number | null> {
-  try {
-    const response = await client.session.messages({ path: { id: sessionID } })
-    const messages = response.data ?? []
+// ---- Session API helpers ----
 
+async function getElapsedSinceLastPrompt(ctx: any, sessionID: string, nowMs = Date.now()): Promise<number | null> {
+  try {
+    const messages = await ctx.session.context({ sessionID })
+    if (!Array.isArray(messages)) {
+      return null
+    }
     let lastUserMessageTime: number | null = null
     for (const msg of messages) {
       const info = msg.info
@@ -378,13 +393,12 @@ async function getElapsedSinceLastPrompt(
         }
       }
     }
-
     if (lastUserMessageTime !== null) {
       return (nowMs - lastUserMessageTime) / 1000
     }
   } catch {
+    // ignore
   }
-
   return null
 }
 
@@ -393,15 +407,12 @@ interface SessionInfo {
   title: string | null
 }
 
-async function getSessionInfo(
-  client: PluginInput["client"],
-  sessionID: string
-): Promise<SessionInfo> {
+async function getSessionInfo(ctx: any, sessionID: string): Promise<SessionInfo> {
   try {
-    const response = await client.session.get({ path: { id: sessionID } })
-    const title = typeof response.data?.title === "string" ? response.data.title : null
+    const session = await ctx.session.get({ sessionID })
+    const title = typeof session?.title === "string" ? session.title : null
     return {
-      isChild: !!response.data?.parentID,
+      isChild: !!session?.parentID,
       title,
     }
   } catch {
@@ -410,10 +421,9 @@ async function getSessionInfo(
 }
 
 async function processSessionIdle(
-  client: PluginInput["client"],
+  ctx: any,
   config: NotifierConfig,
   projectName: string | null,
-  event: unknown,
   sessionID: string,
   sequence: number,
   idleReceivedAtMs: number
@@ -426,14 +436,13 @@ async function processSessionIdle(
     return
   }
 
-  // Fast path: if we already know this is a subagent from in-memory tracking,
-  // skip the API call and go straight to subagent_complete
+  // Fast path: already known subagent — skip API call
   if (subagentSessionIds.has(sessionID)) {
-    await handleEventWithElapsedTime(client, config, "subagent_complete", projectName, event, idleReceivedAtMs, null)
+    await handleEventWithElapsedTime(ctx, config, "subagent_complete", projectName, sessionID, idleReceivedAtMs, null)
     return
   }
 
-  const sessionInfo = await getSessionInfo(client, sessionID)
+  const sessionInfo = await getSessionInfo(ctx, sessionID)
 
   if (!hasCurrentSessionIdleSequence(sessionID, sequence)) {
     return
@@ -444,44 +453,44 @@ async function processSessionIdle(
   }
 
   if (!sessionInfo.isChild) {
-    await handleEventWithElapsedTime(client, config, "complete", projectName, event, idleReceivedAtMs, sessionInfo.title)
+    await handleEventWithElapsedTime(ctx, config, "complete", projectName, sessionID, idleReceivedAtMs, sessionInfo.title)
     return
   }
 
-  // Update in-memory set now that we confirmed it's a child via API
   subagentSessionIds.add(sessionID)
-  await handleEventWithElapsedTime(client, config, "subagent_complete", projectName, event, idleReceivedAtMs, sessionInfo.title)
+  await handleEventWithElapsedTime(
+    ctx,
+    config,
+    "subagent_complete",
+    projectName,
+    sessionID,
+    idleReceivedAtMs,
+    sessionInfo.title
+  )
 }
 
-function scheduleSessionIdle(
-  client: PluginInput["client"],
-  config: NotifierConfig,
-  projectName: string | null,
-  event: unknown,
-  sessionID: string
-): void {
+function scheduleSessionIdle(ctx: any, config: NotifierConfig, projectName: string | null, sessionID: string): void {
   clearPendingIdleTimer(sessionID)
   const sequence = bumpSessionIdleSequence(sessionID)
   const idleReceivedAtMs = Date.now()
 
   const timer = setTimeout(() => {
     pendingIdleTimers.delete(sessionID)
-    void processSessionIdle(client, config, projectName, event, sessionID, sequence, idleReceivedAtMs).catch(() => undefined)
+    void processSessionIdle(ctx, config, projectName, sessionID, sequence, idleReceivedAtMs).catch(() => undefined)
   }, IDLE_COMPLETE_DELAY_MS)
 
   pendingIdleTimers.set(sessionID, timer)
 }
 
 async function handleEventWithElapsedTime(
-  client: PluginInput["client"],
+  ctx: any,
   config: NotifierConfig,
   eventType: EventType,
   projectName: string | null,
-  event: unknown,
+  sessionID: string,
   elapsedReferenceNowMs?: number,
   preloadedSessionTitle?: string | null
 ): Promise<void> {
-  const sessionID = getSessionIDFromEvent(event)
   const commandMinDuration = config.command?.minDuration
   const shouldLookupElapsedForCommand =
     !!config.command?.enabled &&
@@ -500,162 +509,211 @@ async function handleEventWithElapsedTime(
 
   let elapsedSeconds: number | null = null
   if (shouldLookupElapsed) {
-    if (sessionID) {
-      elapsedSeconds = await getElapsedSinceLastPrompt(client, sessionID, elapsedReferenceNowMs)
-    }
+    elapsedSeconds = await getElapsedSinceLastPrompt(ctx, sessionID, elapsedReferenceNowMs)
   }
 
   let sessionTitle: string | null = preloadedSessionTitle ?? null
-  const shouldLookupSessionInfo = sessionID && !sessionTitle && (config.showSessionTitle || shouldResolveAgentNameForEvent(config, eventType))
+  const shouldLookupSessionInfo =
+    sessionID && !sessionTitle && (config.showSessionTitle || shouldResolveAgentNameForEvent(config, eventType))
   if (shouldLookupSessionInfo) {
-    const info = await getSessionInfo(client, sessionID)
+    const info = await getSessionInfo(ctx, sessionID)
     sessionTitle = info.title
   }
 
   const agentName = extractAgentNameFromSessionTitle(sessionTitle)
-
   await handleEvent(config, eventType, projectName, elapsedSeconds, sessionTitle, sessionID, agentName)
 }
 
-export const NotifierPlugin: Plugin = async ({ client, directory }) => {
-  captureStartupWindowId()
+// ---- Idle detection polling ----
+// V2 has no session.idle event.  The context hook fires right before each model
+// call inside the agent loop.  By tracking the last time it fired per session
+// we can detect when a session goes idle (no model calls for IDLE_CHECK_DELAY_MS).
 
-  const clientEnv = process.env.OPENCODE_CLIENT
-  if (clientEnv && clientEnv !== "cli") {
-    const config = loadConfig()
-    if (!config.enableOnDesktop) return {}
+async function detectIdleSessions(ctx: any, config: NotifierConfig, projectName: string | null): Promise<void> {
+  const now = Date.now()
+  const toRemove: string[] = []
+
+  for (const [sessionID, lastContextAt] of sessionLastContextAt) {
+    if (now - lastContextAt > IDLE_CHECK_DELAY_MS) {
+      if (isCLIClient(process.env.OPENCODE_CLIENT)) {
+        const sequence = bumpSessionIdleSequence(sessionID)
+        await processSessionIdle(ctx, config, projectName, sessionID, sequence, now).catch(() => undefined)
+      } else {
+        scheduleSessionIdle(ctx, config, projectName, sessionID)
+      }
+    } else if (now - lastContextAt > 120_000) {
+      // Stale entry — no activity for 2 minutes
+      toRemove.push(sessionID)
+    }
   }
 
-  const getConfig = () => loadConfig()
-  const projectName = directory ? (getConfig().showFullPath ? directory : basename(directory)) : null
-
-  // Fire client_connected after the plugin is fully initialized.
-  // There is no SDK event that reliably signals client connection from a plugin's
-  // perspective, so we approximate it with a short delay after plugin startup.
-  // Config is read at fire-time so that any user overrides are respected.
-  // CLI sessions skip the delay since the process may exit before it fires.
-  const isCLI = isCLIClient(clientEnv)
-  if (isCLI) {
-    void handleEvent(getConfig(), "client_connected", projectName, null)
-  } else {
-    setTimeout(() => {
-      void handleEvent(getConfig(), "client_connected", projectName, null)
-    }, 100)
-  }
-
-  return {
-    event: async ({ event }) => {
-      const config = getConfig()
-
-      // Track subagent sessions from session lifecycle events
-      if (event.type === "session.created") {
-        const info = getSessionLifecycleInfo(event)
-        if (info.parentID && info.id) {
-          subagentSessionIds.add(info.id)
-        } else {
-          // Non-subagent session started
-          await handleEvent(config, "session_started", projectName, null, info.title, info.id, null)
-        }
-      }
-
-      if (event.type === "session.updated") {
-        const info = getSessionLifecycleInfo(event)
-        if (info.parentID && info.id) {
-          subagentSessionIds.add(info.id)
-        }
-      }
-
-      if (event.type === "session.deleted") {
-        const info = getSessionLifecycleInfo(event)
-        if (info.id) {
-          subagentSessionIds.delete(info.id)
-        }
-      }
-
-      if ((event as any).type === "permission.asked") {
-        const sessionID = getSessionIDFromEvent(event)
-        const permissionID = getPermissionIDFromEvent(event)
-        let stillPending = true
-        if (permissionID) {
-          // Auto-approved requests are resolved immediately, so wait briefly
-          // and only notify when the request is still pending.
-          await new Promise((resolve) => setTimeout(resolve, PERMISSION_PENDING_GRACE_MS))
-          stillPending = await isPermissionStillPending(client, permissionID)
-        }
-        // Claim the shared dedupe window only when a notification is actually
-        // about to fire: a silently skipped auto-approved request must not mute a
-        // real one arriving within the same second.
-        if (stillPending && !shouldSuppressPermissionAlert(sessionID)) {
-          await handleEventWithElapsedTime(client, config, "permission", projectName, event)
-        }
-      }
-
-      if (event.type === "session.idle") {
-        const sessionID = getSessionIDFromEvent(event)
-        if (sessionID) {
-          if (isCLI) {
-            // CLI sessions (opencode run) exit soon after going idle.
-            // Process completion directly to avoid losing the notification
-            // when the process terminates before the debounce timer fires.
-            const idleReceivedAtMs = Date.now()
-            const sequence = bumpSessionIdleSequence(sessionID)
-            await processSessionIdle(client, config, projectName, event, sessionID, sequence, idleReceivedAtMs)
-          } else {
-            scheduleSessionIdle(client, config, projectName, event, sessionID)
-          }
-        } else {
-          await handleEventWithElapsedTime(client, config, "complete", projectName, event)
-        }
-      }
-
-      if (event.type === "session.status" && event.properties.status.type === "busy") {
-        markSessionBusy(event.properties.sessionID)
-      }
-
-      if (event.type === "session.error") {
-        const sessionID = getSessionIDFromEvent(event)
-        markSessionError(sessionID)
-        const eventType: EventType = event.properties.error?.name === "MessageAbortedError" ? "user_cancelled" : "error"
-        let sessionTitle: string | null = null
-        if (sessionID && config.showSessionTitle) {
-          const info = await getSessionInfo(client, sessionID)
-          sessionTitle = info.title
-        }
-        await handleEventWithElapsedTime(client, config, eventType, projectName, event, undefined, sessionTitle)
-      }
-
-      if (event.type === "message.updated") {
-        const info = getMessageUpdatedInfo(event)
-        if (info.role === "user") {
-          const sessionID = info.sessionID
-          // Only fire for non-subagent sessions
-          if (!sessionID || !subagentSessionIds.has(sessionID)) {
-            await handleEvent(config, "user_message", projectName, null, null, sessionID, null)
-          }
-        }
-      }
-    },
-    "permission.ask": async () => {
-      const config = getConfig()
-      if (!shouldSuppressPermissionAlert(null)) {
-        await handleEvent(config, "permission", projectName, null)
-      }
-    },
-    "tool.execute.before": async (input) => {
-      const config = getConfig()
-      if (input.tool === "question") {
-        await handleEvent(config, "question", projectName, null)
-      }
-      if (input.tool === "plan_exit") {
-        await handleEvent(config, "plan_exit", projectName, null)
-      }
-    },
+  for (const sid of toRemove) {
+    sessionLastContextAt.delete(sid)
   }
 }
 
-const pluginModule: PluginModule = {
+// ---- Plugin definition ----
+
+export default Plugin.define({
   id: "opencode-notifier",
-  server: NotifierPlugin,
-}
+  async setup(ctx) {
+    captureStartupWindowId()
 
-export default pluginModule
+    const clientEnv = process.env.OPENCODE_CLIENT
+    const initialConfig = loadConfig()
+    if (clientEnv && clientEnv !== "cli" && !initialConfig.enableOnDesktop) {
+      return
+    }
+
+    const getConfig = () => loadConfig()
+    const projectName = ctx.location.directory
+      ? initialConfig.showFullPath
+        ? ctx.location.directory
+        : basename(ctx.location.directory)
+      : null
+
+    // Fire client_connected right after plugin init.  CLI sessions skip the
+    // delay because the process may exit before a timeout fires.
+    const isCLI = isCLIClient(clientEnv)
+    if (isCLI) {
+      void handleEvent(getConfig(), "client_connected", projectName, null)
+    } else {
+      setTimeout(() => {
+        void handleEvent(getConfig(), "client_connected", projectName, null)
+      }, 100)
+    }
+
+    // ---- Session context hook (activity tracking) ----
+    // Fires before every model call in the agent loop.  We use it to track
+    // per-session activity; when a session hasn't called the context hook
+    // for IDLE_CHECK_DELAY_MS we treat it as idle (generation complete).
+    const contextRegistration = await ctx.session.hook("context", (event) => {
+      sessionLastContextAt.set(event.sessionID, Date.now())
+    })
+
+    // ---- Permission hook ----
+    // Fires when a permission rule is evaluated.  We fire a notification
+    // for each evaluation and rely on the shared dedupe window to suppress
+    // duplicates from rapid re-evaluations.
+    const permissionRegistration = await ctx.permission.hook("evaluate", async (event: any) => {
+      if (shouldSuppressPermissionAlert(null)) {
+        return
+      }
+
+      const sessionID = event.sessionID ?? event.data?.sessionID ?? null
+      const permissionID = event.requestID ?? event.data?.requestID ?? getPermissionIDFromEvent(event)
+
+      // If we can resolve the permission, check if it's still pending after
+      // the grace period so that auto-approved requests don't trigger
+      // notifications.
+      if (permissionID && sessionID) {
+        await new Promise((resolve) => setTimeout(resolve, PERMISSION_PENDING_GRACE_MS))
+        if (!(await isPermissionStillPending(ctx, sessionID, permissionID))) {
+          return
+        }
+      }
+
+      await handleEvent(getConfig(), "permission", projectName, null)
+    })
+
+    // ---- Prompt hook (user message detection) ----
+    // Fires when a user prompt is admitted.  We fire "user_message" for
+    // non-subagent sessions so the plugin can notify on new user input.
+    const promptRegistration = await ctx.session.hook("prompt", async (event: any) => {
+      const sessionID = event.sessionID
+      if (!sessionID || !subagentSessionIds.has(sessionID)) {
+        await handleEvent(getConfig(), "user_message", projectName, null, null, sessionID, null)
+      }
+    })
+
+    // ---- Retry hook (error detection) ----
+    // Fires when a provider request fails.  We detect non-retryable errors
+    // (when the retry decision is "no") and fire an "error" notification.
+    const retryRegistration = await ctx.session.hook("retry", async (event: any) => {
+      const sessionID = event.sessionID
+      if (event.decision?.retry !== false) {
+        return
+      }
+
+      if (shouldSuppressSessionIdle(sessionID, false)) {
+        return
+      }
+
+      const eventType: EventType =
+        event.error?.type === "MessageAbortedError" ? "user_cancelled" : "error"
+
+      markSessionError(sessionID)
+      let sessionTitle: string | null = null
+      if (sessionID && loadConfig().showSessionTitle) {
+        const info = await getSessionInfo(ctx, sessionID)
+        sessionTitle = info.title
+      }
+      await handleEventWithElapsedTime(
+        ctx,
+        getConfig(),
+        eventType,
+        projectName,
+        sessionID,
+        undefined,
+        sessionTitle
+      )
+    })
+
+    // ---- Event subscription (session lifecycle) ----
+    // V2 provides `session.created` and `session.agent.selected` events that
+    // let us track subagent sessions and fire "session_started" for new
+    // top-level sessions.
+    const eventController = new AbortController()
+    void (async () => {
+      for await (const event of ctx.event.subscribe({ signal: eventController.signal })) {
+        if (event.type === "session.created") {
+          const data = getEventData(event)
+          if (data.parentID && data.sessionID) {
+            subagentSessionIds.add(data.sessionID)
+          } else if (data.sessionID) {
+            await handleEvent(
+              getConfig(),
+              "session_started",
+              projectName,
+              null,
+              data.title,
+              data.sessionID,
+              null
+            )
+          }
+        }
+      }
+    })()
+
+    // ---- Idle detection polling loop ----
+    // Since V2 doesn't emit a session.idle event, we poll the context
+    // activity timestamps periodically to detect when sessions become idle.
+    const pollController = new AbortController()
+    void (async () => {
+      while (true) {
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, IDLE_POLL_INTERVAL_MS)
+          pollController.signal.addEventListener("abort", () => {
+            clearTimeout(timer)
+            resolve()
+          }, { once: true })
+        })
+        if (pollController.signal.aborted) {
+          break
+        }
+        void detectIdleSessions(ctx, getConfig(), projectName).catch(() => undefined)
+      }
+    })()
+
+    // ---- Cleanup ----
+    // Abort subscriptions and dispose hooks on plugin unload.
+    return () => {
+      contextRegistration.dispose()
+      permissionRegistration.dispose()
+      promptRegistration.dispose()
+      retryRegistration.dispose()
+      eventController.abort()
+      pollController.abort()
+    }
+  },
+})
