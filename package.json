@@ -21,7 +21,7 @@
     "logos"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --external node-notifier",
+    "build": "bun build src/index.ts --outdir dist --target node",
     "prepublishOnly": "bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test"

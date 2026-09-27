@@ -206,16 +206,22 @@ const DEFAULT_CONFIG: NotifierConfig = {
   },
 }
 
+function getPluginDir(): string {
+  return dirname(fileURLToPath(import.meta.url))
+}
+
 export function getConfigPath(): string {
   if (process.env.OPENCODE_NOTIFIER_CONFIG_PATH) {
     return process.env.OPENCODE_NOTIFIER_CONFIG_PATH
   }
-  return join(homedir(), ".config", "opencode", "opencode-notifier.json")
+  return join(getPluginDir(), "opencode-notifier.json")
 }
 
 export function getStatePath(): string {
-  const configPath = getConfigPath()
-  return join(dirname(configPath), "opencode-notifier-state.json")
+  if (process.env.OPENCODE_NOTIFIER_CONFIG_PATH) {
+    return join(dirname(process.env.OPENCODE_NOTIFIER_CONFIG_PATH), "opencode-notifier-state.json")
+  }
+  return join(getPluginDir(), "opencode-notifier-state.json")
 }
 
 function parseEventConfig(
