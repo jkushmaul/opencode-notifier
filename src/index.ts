@@ -22,9 +22,13 @@ import { runCommand } from "./command"
 import { isTerminalFocused, focusTerminal, captureStartupWindowId, isKDEJumpBackSupported } from "./focus"
 import { shouldSuppressPermissionAlert, prunePermissionAlertState } from "./permission-dedupe"
 
-const IDLE_POLL_INTERVAL_MS = 3000
-const IDLE_CHECK_DELAY_MS = 2000
+const IDLE_POLL_INTERVAL_MS = 10000
+const IDLE_CHECK_DELAY_MS = 30000
 const IDLE_COMPLETE_DELAY_MS = 350
+
+// Cooldown after firing a "complete" notification for a session so we don't
+// spam when a session rapidly oscillates between idle and busy.
+const IDLE_COMPLETE_COOLDOWN_MS = 60_000
 
 export function isCLIClient(clientEnv?: string): boolean {
   return !clientEnv || clientEnv === "cli"
@@ -42,6 +46,9 @@ const sessionErrorSuppressionAt = new Map<string, number>()
 const sessionLastBusyAt = new Map<string, number>()
 const pendingIdleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const subagentSessionIds = new Set<string>()
+
+// Last time we fired a "complete" notification per session (cooldown).
+const sessionLastCompleteAt = new Map<string, number>()
 
 type UnknownRecord = Record<string, unknown>
 
@@ -132,6 +139,13 @@ const cleanupInterval = setInterval(() => {
   }
 
   prunePermissionAlertState(cutoff)
+
+  // Prune stale complete-cooldown entries
+  for (const [sessionID, timestamp] of sessionLastCompleteAt) {
+    if (timestamp < cutoff) {
+      sessionLastCompleteAt.delete(sessionID)
+    }
+  }
 }, 5 * 60 * 1000)
 cleanupInterval.unref()
 
@@ -436,8 +450,17 @@ async function processSessionIdle(
     return
   }
 
+  // Cooldown: don't fire "complete" more than once per session within
+  // IDLE_COMPLETE_COOLDOWN_MS so we don't spam when a session rapidly
+  // oscillates between idle and busy.
+  const lastCompleteAt = sessionLastCompleteAt.get(sessionID)
+  if (lastCompleteAt && Date.now() - lastCompleteAt < IDLE_COMPLETE_COOLDOWN_MS) {
+    return
+  }
+
   // Fast path: already known subagent — skip API call
   if (subagentSessionIds.has(sessionID)) {
+    sessionLastCompleteAt.set(sessionID, Date.now())
     await handleEventWithElapsedTime(ctx, config, "subagent_complete", projectName, sessionID, idleReceivedAtMs, null)
     return
   }
@@ -453,11 +476,13 @@ async function processSessionIdle(
   }
 
   if (!sessionInfo.isChild) {
+    sessionLastCompleteAt.set(sessionID, Date.now())
     await handleEventWithElapsedTime(ctx, config, "complete", projectName, sessionID, idleReceivedAtMs, sessionInfo.title)
     return
   }
 
   subagentSessionIds.add(sessionID)
+  sessionLastCompleteAt.set(sessionID, Date.now())
   await handleEventWithElapsedTime(
     ctx,
     config,
